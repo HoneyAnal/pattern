@@ -243,6 +243,22 @@
     .thumb-box canvas { width:48px; height:48px; }
     .source-preview canvas { touch-action: none; }
   }
+
+  /* ===== Раскладка панелей: перестановка и плавающие окна ===== */
+  .sec-tools { margin-left:auto; display:flex; gap:4px; }
+  .sec-btn { background:var(--panel2); color:var(--muted); border:0; border-radius:3px; width:22px; height:20px; font-size:12px; line-height:1; cursor:pointer; padding:0; text-transform:none; }
+  .sec-btn:hover { background:var(--accent); color:#fff; }
+  .sec-btn.grip { cursor:grab; touch-action:none; }
+  .section.dragging { opacity:.45; }
+  .drop-line { height:3px; background:var(--accent); border-radius:2px; margin:0 8px; flex-shrink:0; pointer-events:none; }
+  .sec-ph { display:none; }
+  .float-win { position:fixed; z-index:60; min-width:220px; max-width:90vw; background:var(--panel); border:1px solid #000; border-radius:6px; box-shadow:0 8px 30px rgba(0,0,0,.65); resize:horizontal; overflow:auto; max-height:92vh; }
+  .float-bar { display:flex; align-items:center; gap:6px; padding:5px 8px; background:#2c3a57; cursor:move; user-select:none; touch-action:none; font-size:11px; text-transform:uppercase; letter-spacing:.5px; color:#cfe0ff; position:sticky; top:0; z-index:1; }
+  .float-bar span { flex:1; }
+  .float-win .section { border-bottom:none; }
+  .float-win .section.floating > .section-title { display:none; }
+  .layout-reset { margin:10px 16px; width:calc(100% - 32px); flex-shrink:0; }
+  @media (max-width: 700px) { .sec-btn.pop { display:none; } }
 </style>
 </head>
 <body>
@@ -403,6 +419,14 @@
         </div>
         <input type="range" id="varSlider" min="0" max="100" value="0">
         <button id="varSeedBtn" class="reset-btn" style="margin-top:6px;"><span class="icon">🎲</span><span>New variation</span></button>
+
+        <div class="field-row">
+          <label>Smooth
+            <span class="hint-icon" data-tip="Edge-preserving smoothing: removes grain, text and fine detail of the photo inside color areas but keeps the shapes sharp. Higher = flatter, more painted look. Wraps around, so seamless patterns stay seamless.">?</span>
+          </label>
+          <span class="val" id="smoothVal">0</span>
+        </div>
+        <input type="range" id="smoothSlider" min="0" max="100" value="0">
       </div>
     </div>
 
@@ -564,6 +588,8 @@ const mosaicGapVal = document.getElementById('mosaicGapVal');
 const mosaicGapColor = document.getElementById('mosaicGapColor');
 const mosaicGapClear = document.getElementById('mosaicGapClear');
 const varSlider = document.getElementById('varSlider');
+const smoothSlider = document.getElementById('smoothSlider');
+const smoothVal = document.getElementById('smoothVal');
 const varVal = document.getElementById('varVal');
 const varSeedBtn = document.getElementById('varSeedBtn');
 const cBright = document.getElementById('cBright');
@@ -873,6 +899,10 @@ waveSlider.addEventListener('input', () => {
 });
 varSlider.addEventListener('input', () => {
   varVal.textContent = Math.round(parseFloat(varSlider.value));
+  scheduleHeavyRender();
+});
+smoothSlider.addEventListener('input', () => {
+  smoothVal.textContent = Math.round(parseFloat(smoothSlider.value));
   scheduleHeavyRender();
 });
 varSeedBtn.addEventListener('click', () => {
@@ -1252,6 +1282,72 @@ function mulberry32(a) {
     t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
     return ((t ^ t >>> 14) >>> 0) / 4294967296;
   };
+}
+// Сглаживание, сохраняющее контуры: повторный билатеральный фильтр (по осям отдельно) с заворотом краёв,
+// поэтому бесшовность сохраняется. Убирает зерно и мелкие детали фото, формы остаются чёткими.
+// Считается на уменьшенной копии (cap), радиус задан долей от размера тайла => превью и экспорт похожи.
+function bilateralPass(src, dst, W, H, horiz, r, ws, lut, hasAlpha) {
+  for (let y = 0; y < H; y++) {
+    for (let x = 0; x < W; x++) {
+      const o = (y * W + x) * 4;
+      const r0 = src[o], g0 = src[o + 1], b0 = src[o + 2];
+      let sr = 0, sg = 0, sb = 0, sa = 0, den = 0, denA = 0;
+      for (let k = -r; k <= r; k++) {
+        let j;
+        if (horiz) { let xx = x + k; if (xx < 0) xx += W; else if (xx >= W) xx -= W; j = (y * W + xx) * 4; }
+        else { let yy = y + k; if (yy < 0) yy += H; else if (yy >= H) yy -= H; j = (yy * W + x) * 4; }
+        const jr = src[j], jg = src[j + 1], jb = src[j + 2];
+        let d = jr - r0; if (d < 0) d = -d;
+        let e = jg - g0; d += e < 0 ? -e : e;
+        e = jb - b0; d += e < 0 ? -e : e;
+        const w = ws[k + r] * lut[d];
+        const wa = hasAlpha ? w * (src[j + 3] + 1) : w;
+        sr += jr * wa; sg += jg * wa; sb += jb * wa; sa += src[j + 3] * w;
+        den += wa; denA += w;
+      }
+      dst[o] = sr / den + 0.5; dst[o + 1] = sg / den + 0.5; dst[o + 2] = sb / den + 0.5;
+      dst[o + 3] = sa / denA + 0.5;
+    }
+  }
+}
+function applySmooth(canvas, nX, nY, cap) {
+  const amt = parseFloat(smoothSlider.value) / 100;
+  if (!(amt > 0)) return;
+  const OW = canvas.width, OH = canvas.height;
+  const f = Math.min(1, cap / Math.max(OW, OH));
+  const W = Math.max(8, Math.round(OW * f)), H = Math.max(8, Math.round(OH * f));
+  let wc = canvas, work = null;
+  if (W !== OW || H !== OH) {
+    work = document.createElement('canvas'); work.width = W; work.height = H;
+    const wctx = work.getContext('2d');
+    wctx.imageSmoothingEnabled = true; wctx.imageSmoothingQuality = 'high';
+    wctx.drawImage(canvas, 0, 0, W, H);
+    wc = work;
+  }
+  const ctx = wc.getContext('2d');
+  const img = ctx.getImageData(0, 0, W, H);
+  let a = img.data, b = new Uint8ClampedArray(a.length);
+  let hasAlpha = false;
+  for (let i = 3; i < a.length; i += 4) if (a[i] !== 255) { hasAlpha = true; break; }
+  const iters = Math.max(1, Math.round(1 + amt * 11));
+  const sigC = 40;
+  const tile = Math.min(W / nX, H / nY);
+  const r = Math.max(1, Math.min(6, Math.round(tile * 0.027)));
+  const ws = new Float32Array(2 * r + 1);
+  for (let k = -r; k <= r; k++) ws[k + r] = Math.exp(-(k * k) / (2 * (r * 0.8) * (r * 0.8)));
+  const lut = new Float32Array(766);
+  for (let d = 0; d < 766; d++) lut[d] = Math.exp(-(d * d) / (2 * sigC * sigC));
+  for (let it = 0; it < iters; it++) {
+    bilateralPass(a, b, W, H, true, r, ws, lut, hasAlpha);
+    bilateralPass(b, a, W, H, false, r, ws, lut, hasAlpha);
+  }
+  ctx.putImageData(img, 0, 0);
+  if (work) {
+    const mctx = canvas.getContext('2d');
+    mctx.clearRect(0, 0, OW, OH);
+    mctx.imageSmoothingEnabled = true; mctx.imageSmoothingQuality = 'high';
+    mctx.drawImage(work, 0, 0, OW, OH);
+  }
 }
 function applyVariation(canvas, nX, nY) {
   const amt = parseFloat(varSlider.value) / 100;
@@ -2220,6 +2316,7 @@ function draw() {
   try {
     paintPattern(off.getContext('2d'), e.w, e.h, mode, tileE, e.nX, e.nY);
     applyWave(off, e.nX, e.nY);
+    applySmooth(off, e.nX, e.nY, 640);
     applyVariation(off, e.nX, e.nY);
   } finally {
     S = savedS;
@@ -2341,6 +2438,7 @@ function buildFinalCanvas() {
 
     paintPattern(ctx, e.w, e.h, mode, tileFromOriginal, e.nX, e.nY);
     applyWave(c, e.nX, e.nY);
+    applySmooth(c, e.nX, e.nY, 1400);
     if (!isSingleExport()) applyVariation(c, e.nX, e.nY);
   } finally {
     workingImg = oldWorking;
@@ -2438,7 +2536,7 @@ if (!(window.CSS && CSS.supports && CSS.supports('height', '100dvh'))) {
 const HASH_FIELDS = [
   ['m', patternSelect, 'select'], ['bg', bgModeSelect, 'select'], ['bgc', bgColorPicker, 'color'],
   ['sc', scaleSlider, 'num'], ['rot', rotSlider, 'num'], ['cnt', countSlider, 'num'],
-  ['wv', waveSlider, 'num'], ['vr', varSlider, 'num'],
+  ['wv', waveSlider, 'num'], ['vr', varSlider, 'num'], ['sm', smoothSlider, 'num'],
   ['cb', cBright, 'num'], ['cc', cContrast, 'num'], ['cs', cSat, 'num'], ['ch', cHue, 'num'], ['ct', cTone, 'select'],
   ['mn', mandalaN, 'num'], ['mt', mandalaTwist, 'num'], ['mg', mosaicGapSlider, 'num'], ['mc', mosaicGapColor, 'color'],
   ['ex', exportSizeSelect, 'select'], ['el', exportLayoutSelect, 'select'], ['ef', exportFormatSelect, 'select']
@@ -2537,6 +2635,164 @@ updateExportLine();
 updateBgHint();
 drawSelector();
 drawPatternPreview();
+
+// ============ РАСКЛАДКА ПАНЕЛЕЙ: перестановка и плавающие окна ============
+(function () {
+  const right = document.querySelector('.right-col');
+  const exportBlock = right.querySelector('.export-block');
+  const KEY = 'patternStudio.layout.v1';
+  const narrow = () => window.matchMedia('(max-width: 700px)').matches;
+  const secs = [...right.querySelectorAll(':scope > .section')];
+  const byId = {};
+  const used = {};
+  secs.forEach((sec, i) => {
+    const t = sec.querySelector('.section-title');
+    let name = (t.firstChild && t.firstChild.textContent || '').trim().replace(/^[^\w]+/, '');
+    let id = name.replace(/\W+/g, '').toLowerCase() || ('sec' + i);
+    if (used[id]) id += i;
+    used[id] = true;
+    sec.dataset.id = id; sec.dataset.name = name || id;
+    byId[id] = sec;
+    const tools = document.createElement('span');
+    tools.className = 'sec-tools';
+    tools.innerHTML = '<button class="sec-btn grip" title="Drag to reorder">⠿</button><button class="sec-btn pop" title="Pop out into a window">⧉</button>';
+    tools.addEventListener('click', e => e.stopPropagation());
+    t.appendChild(tools);
+    tools.querySelector('.grip').addEventListener('pointerdown', e => startReorder(e, sec));
+    tools.querySelector('.pop').addEventListener('click', () => {
+      const r = sec.getBoundingClientRect();
+      popOut(sec, { x: Math.max(8, r.left - 360), y: Math.max(8, Math.min(r.top, innerHeight - 200)), w: 320 });
+      save();
+    });
+  });
+
+  const layoutBtn = document.createElement('button');
+  layoutBtn.className = 'reset-btn layout-reset';
+  layoutBtn.innerHTML = '<span class="icon">⟲</span><span>Reset panel layout</span>';
+  right.insertBefore(layoutBtn, exportBlock);
+
+  function docked() { return [...right.querySelectorAll(':scope > .section')]; }
+
+  function save() {
+    try {
+      const floats = [...document.querySelectorAll('.float-win')].map(w => ({
+        id: w.dataset.id, x: parseInt(w.style.left, 10), y: parseInt(w.style.top, 10), w: parseInt(w.style.width, 10)
+      }));
+      localStorage.setItem(KEY, JSON.stringify({ order: docked().map(s => s.dataset.id), floats }));
+    } catch (e) {}
+  }
+
+  // ---- перестановка перетаскиванием за ⠿ ----
+  function startReorder(e, sec) {
+    e.preventDefault(); e.stopPropagation();
+    sec.classList.add('dragging');
+    const line = document.createElement('div'); line.className = 'drop-line';
+    let before = null;
+    const move = ev => {
+      const rr = right.getBoundingClientRect();
+      if (ev.clientY < rr.top + 40) right.scrollTop -= 12;
+      else if (ev.clientY > rr.bottom - 40) right.scrollTop += 12;
+      before = null;
+      for (const o of docked()) {
+        if (o === sec) continue;
+        const r = o.getBoundingClientRect();
+        if (ev.clientY < r.top + r.height / 2) { before = o; break; }
+      }
+      right.insertBefore(line, before || layoutBtn);
+    };
+    const up = () => {
+      window.removeEventListener('pointermove', move);
+      window.removeEventListener('pointerup', up);
+      window.removeEventListener('pointercancel', up);
+      sec.classList.remove('dragging');
+      if (line.parentNode) { right.insertBefore(sec, line); line.remove(); }
+      save();
+    };
+    window.addEventListener('pointermove', move);
+    window.addEventListener('pointerup', up);
+    window.addEventListener('pointercancel', up);
+    move(e);
+  }
+
+  // ---- плавающие окна ----
+  let zTop = 60;
+  function popOut(sec, pos) {
+    const id = sec.dataset.id;
+    const ph = document.createElement('div'); ph.className = 'sec-ph'; ph.dataset.for = id;
+    right.insertBefore(ph, sec);
+    const win = document.createElement('div');
+    win.className = 'float-win'; win.dataset.id = id;
+    win.style.left = pos.x + 'px'; win.style.top = pos.y + 'px'; win.style.width = (pos.w || 320) + 'px';
+    const bar = document.createElement('div'); bar.className = 'float-bar';
+    bar.innerHTML = '<span></span><button class="sec-btn" title="Dock back to the panel">⇲</button>';
+    bar.firstChild.textContent = sec.dataset.name;
+    win.appendChild(bar); win.appendChild(sec);
+    document.body.appendChild(win);
+    sec.classList.remove('collapsed'); sec.classList.add('floating');
+    win.addEventListener('pointerdown', () => { win.style.zIndex = ++zTop; });
+    bar.querySelector('button').addEventListener('click', () => { dock(win); save(); });
+    bar.addEventListener('pointerdown', e => {
+      if (e.target.closest('button')) return;
+      e.preventDefault();
+      const ox = e.clientX - win.offsetLeft, oy = e.clientY - win.offsetTop;
+      const mv = ev => {
+        win.style.left = Math.min(innerWidth - 60, Math.max(-win.offsetWidth + 60, ev.clientX - ox)) + 'px';
+        win.style.top = Math.min(innerHeight - 30, Math.max(0, ev.clientY - oy)) + 'px';
+      };
+      const upf = () => {
+        window.removeEventListener('pointermove', mv);
+        window.removeEventListener('pointerup', upf);
+        save();
+      };
+      window.addEventListener('pointermove', mv);
+      window.addEventListener('pointerup', upf);
+    });
+    if (window.ResizeObserver) new ResizeObserver(() => { save(); }).observe(win);
+    if (typeof render === 'function') render();
+  }
+  function dock(win) {
+    const sec = win.querySelector('.section');
+    const ph = right.querySelector('.sec-ph[data-for="' + win.dataset.id + '"]');
+    sec.classList.remove('floating');
+    if (ph) { right.insertBefore(sec, ph); ph.remove(); } else right.insertBefore(sec, layoutBtn);
+    win.remove();
+    if (typeof render === 'function') render();
+  }
+
+  layoutBtn.addEventListener('click', () => {
+    document.querySelectorAll('.float-win').forEach(dock);
+    secs.forEach(s => right.insertBefore(s, layoutBtn));
+    try { localStorage.removeItem(KEY); } catch (e) {}
+  });
+
+  // ---- Source: растр канваса подгоняется под реальный размер на экране ----
+  if (window.ResizeObserver) {
+    let last = 0;
+    new ResizeObserver(() => {
+      const w = selectorCanvas.getBoundingClientRect().width;
+      if (!w) return;
+      const px = Math.max(160, Math.min(1400, Math.round(w * (window.devicePixelRatio || 1))));
+      if (Math.abs(px - last) < 2) return;
+      last = px;
+      selectorCanvas.width = px; selectorCanvas.height = px;
+      drawSelector();
+    }).observe(selectorCanvas);
+  }
+
+  // ---- восстановление сохранённой раскладки ----
+  try {
+    const st = JSON.parse(localStorage.getItem(KEY) || 'null');
+    if (st) {
+      (st.order || []).forEach(id => { if (byId[id]) right.insertBefore(byId[id], layoutBtn); });
+      secs.filter(x => !(st.order || []).includes(x.dataset.id) && !(st.floats || []).some(f => f.id === x.dataset.id)).forEach(x => right.insertBefore(x, layoutBtn));
+      if (!narrow()) (st.floats || []).forEach(f => {
+        if (byId[f.id] && isFinite(f.x) && isFinite(f.y)) {
+          popOut(byId[f.id], { x: Math.min(f.x, innerWidth - 80), y: Math.min(f.y, innerHeight - 40), w: f.w });
+        }
+      });
+    }
+  } catch (e) {}
+})();
 </script>
 </body>
 </html>
